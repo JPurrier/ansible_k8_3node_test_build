@@ -1,0 +1,175 @@
+---
+- hosts: k8s
+  vars:
+    docker_edition: 'ce'
+    docker_package_state: present
+
+  roles:
+    - role: geerlingguy.docker
+      become: yes
+
+  tasks:
+  - name: Add K8 Repo
+    yum_repository:
+      name: Kubernetes
+      description: K8 repo
+      baseurl: https://packages.cloud.google.com/yum/repos/kubernetes-el7-x86_64
+      state: present
+      gpgcheck: yes 
+      gpgkey: "https://packages.cloud.google.com/yum/doc/yum-key.gpg\nhttps://packages.cloud.google.com/yum/doc/rpm-package-key.gpg"
+
+  - name: install kubelet kubeadm kubectl
+    yum:
+      name: "{{ packages }}"
+    vars:
+      packages:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+  - name: enable kubelet
+    systemd:
+      state: started
+      name: kubelet
+      enabled: yes
+
+
+  - name: Disable SELINUX
+    shell: setenforce 0
+    shell: sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+    
+  - name: Disable SWAP
+    shell: sed -i '/swap/d' /etc/fstab
+    shell: swapoff -a
+
+- hosts: k8-worker1
+  tasks:
+  - name: change host name
+    hostname:
+      name: kube2
+
+
+- hosts: k8-worker2
+  tasks:
+  - name: change host name
+    hostname:
+      name: kube3
+
+- hosts: k8-master
+  tasks:
+  - name: change host name
+    hostname:
+      name: kube1
+  - name: add firewallports 
+    firewalld:
+      port: 6443/tcp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 2379-2380/tcp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 10250/tcp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 10251/tcp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 10252/tcp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 10255/tcp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 8285/udp
+      permanent: yes
+      state: enabled
+    firewalld:
+      port: 8472/udp
+      permanent: yes
+      state: enabled
+  - name: update Iptables Settings
+  # added extra space in front of EOF delimeter to allow it to work
+    shell: |
+      cat << EOF > /etc/sysctl.d/k8s.conf
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.bridge.bridge-nf-call-iptables = 1
+      EOF
+      sysctl --system
+
+  - name: restart docker
+    service: 
+      name: docker
+      state: restarted
+
+  - name: Create cluster with kubeadmin
+    shell: sudo kubeadm init --pod-network-cidr=10.244.0.0/16
+    register: shell_result
+
+  - name: create .kube directory
+    file:
+      path: $HOME/.kube
+      state: directory
+
+  - name: copy admin.conf to user's kube config
+    copy:
+      src: /etc/kubernetes/admin.conf
+      dest: $HOME/.kube/config
+      remote_src: yes
+  
+  - name: Change kubeconfig file permission
+    file:
+      path: $HOME/.kube/config 
+      owner: "{{ ansible_effective_user_id }}"
+      group: "{{ ansible_effective_group_id }}"
+  
+  - name: Install Flannel
+    shell: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/2140ac876ef134e0ed5af15c65e414cf26827915/Documentation/kube-flannel.yml
+
+  - name: Outputing status of cluster
+    shell: kubectl get pods --all-namespaces
+    register: shell_get_pods
+  - debug:
+      var: shell_get_pods.stdout_lines  
+  
+  - name: get join command
+    shell: kubeadm token create --print-join-command
+    register: join_command_raw
+
+  - name: set join command
+    set_fact:
+      join_command: "{{ join_command_raw.stdout_lines[0] }}"
+  - debug: var=join_command
+
+- hosts: k8-workers
+  tasks:
+  - name: create worksers firewall rules
+    firewalld:
+      port: 10251/tcp
+      permanent: yes
+      state: enabled
+  - firewalld:
+      port: 10255/tcp
+      permanent: yes
+      state: enabled
+  - firewalld:
+      port: 8285/udp
+      permanent: yes
+      state: enabled
+  - firewalld:
+      port: 8472/udp
+      permanent: yes
+      state: enabled
+  - name: join cluster
+    shell: "{{ hostvars['192.168.0.15'].join_command }} --ignore-preflight-errors all  >> node_joined.txt"
+    args:
+      chdir: $HOME
+      creates: node_joined.txt
+
+  - debug:
+      var: shell_result.stdout_lines
